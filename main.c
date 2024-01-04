@@ -5,70 +5,84 @@
 
 #include <math.h>
 #include <time.h>
-#include <unistd.h>
 
-#include <sys/wait.h>
-#include <sys/shm.h>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
+#include <pthread.h>
 
 #include "simple_MLP.h"
 #include "activ_func.c"
 
-struct shmDouble* inputs;
-struct shmDouble* exp_outputs;
+#ifndef M_PI
+#define M_PI (3.14159265358979323846264338327950288)
+#endif
+
+#define DEBUG true
+#define TRAIN true
+#define CUDA false
+
+#define NUM_INPUTS 2
+#define NUM_OUTPUTS 1
+#define H_LAYERS (int[]){3, 2}
+
+#define NUM_EPOCHS 3
+#define NUM_TRAIN_SETS 4
+#define ACTIV_FUNC "SIGMOID"
+
+struct outputResult
+{
+    double output[NUM_OUTPUTS];
+    double exp_output[NUM_OUTPUTS];
+    double err[NUM_OUTPUTS];
+    double cost[NUM_OUTPUTS];
+    double d_dost[NUM_OUTPUTS];
+};
 
 int* structure;
+double inputs[NUM_INPUTS * NUM_TRAIN_SETS];
+double exp_outputs[NUM_OUTPUTS * NUM_TRAIN_SETS];
 double* z_tensor;
 double* a_tensor;
 double* w_tensor;
 
 int output_node_index;
+int num_nodes = 0;
 
-struct outputResult runInference(int, int);
-double nodeMulAcc(int, int , int);
+struct outputResult forwardPass(int, int);
+double nodeMulAcc(int, int, int);
 void backPropSGD(int, int);
 void weightUpdate(double, int, int, int);
 int findMaxInt(int[], int);
-double randGaussian();
+void* printIntArr(int*, int, const char*);
+void* printDoubleArr(double*, int, const char*);
+
 
 int main()
 {
-    inputs = initShmDouble("inputs", NUM_INPUTS * NUM_TRAIN_SETS, true);
-    exp_outputs = initShmDouble("exp_outputs", NUM_OUTPUTS * NUM_TRAIN_SETS, true);
-
-    pid_t IO_DATA_PID = fork();
-    if (IO_DATA_PID == 0)
-    {
-        char* args[] = {"./io_data", NULL};
-        execv("./io_data", args);
+    pthread_t train_data_thread;
+    if (pthread_create(&train_data_thread, NULL, trainData_XOR, NULL) != 0) {
+        fprintf(stderr, "Failed to create thread.\n");
+        return 1;
     }
-    else 
+
+    if (pthread_join(train_data_thread, NULL) != 0) {
+        fprintf(stderr, "Failed to join thread.\n");
+        return 1;
+    }
+
+    if (DEBUG)
     {
-        int io_data_status;
-        waitpid(IO_DATA_PID, &io_data_status, 0);
-        if (WEXITSTATUS(io_data_status) != 0)
+        for (int i_train_set = 0; i_train_set < NUM_TRAIN_SETS; i_train_set++)
         {
-            printf("IO_DATA process failed with exit code %d\n", WEXITSTATUS(io_data_status));
-        }
-        
-        if (DEBUG)
-        {
-            for (int i_train_set = 0; i_train_set < NUM_TRAIN_SETS; i_train_set++)
+            for (int i_input = 0; i_input < NUM_INPUTS; i_input++)
             {
-                printf("DEBUG: ");
-                for (int i_input = 0; i_input < NUM_INPUTS; i_input++)
-                {
-                    printf("INPUT_%f: %f ", i_input, inputs->mem[i_train_set + i_input]);
-                }
-                for (int i_output = 0; i_output < NUM_OUTPUTS; i_output++)
-                {
-                    printf("EXP_OUTPUT_%f: %f ", i_output, exp_outputs->mem[i_train_set + i_output]);  
-                }
-                printf("\n");
+                printf("INPUT_%d: %f ", i_input, inputs[i_train_set + i_input]);
             }
+            for (int i_output = 0; i_output < NUM_OUTPUTS; i_output++)
+            {
+                printf("EXP_OUTPUT_%d: %f ", i_output, exp_outputs[i_train_set + i_output]);  
+            }
+            printf("\n");
         }
+        printf("\n");
     }
 
     /* DEFINE NEURAL NETWORK LAYER AND NODE STRUCTURE AND STORE TO ARRAY */
@@ -90,7 +104,6 @@ int main()
         }
     }
 
-    int num_nodes = 0;
     int num_weights = 0;
     for (int i_layer = 0; i_layer < num_layers; i_layer++)
     {
@@ -100,6 +113,8 @@ int main()
             num_weights += structure[i_layer] * structure[i_layer + 1];
         }
     }
+
+    srand((unsigned int)time(NULL));
 
     z_tensor = (double*)malloc((num_nodes) * sizeof(double));
     a_tensor = (double*)malloc((num_nodes) * sizeof(double));
@@ -117,8 +132,6 @@ int main()
     output_node_index = num_nodes - structure[num_layers - 1];
 
     /* ALLOCATE WEIGHTS ARRAY AND POPULATE WITH RANDOM GAUSSIAN DISTRIBUTION */
-    srand((unsigned int)time(NULL));
-
     w_tensor = (double*)malloc(num_weights * sizeof(double));
     index = 0;
     for (int i_layer = 0; i_layer < num_layers - 1; i_layer++)
@@ -127,29 +140,38 @@ int main()
         {
             for (int j_node = 0; j_node < (structure[i_layer]); j_node++)
             {
-                w_tensor[index] = randGaussian();
+                w_tensor[index] = (double)rand() / RAND_MAX;
                 index++;
             }
         }
+    }
+
+    if (DEBUG)
+    {
+        printIntArr(structure, num_layers, "structure");
+        printDoubleArr(z_tensor, num_nodes, "z_tensor");
+        printDoubleArr(a_tensor, num_nodes, "a_tensor");
+        printDoubleArr(w_tensor, num_weights, "w_tensor");
+        printf("\n");
     }
 
     /* RUN TRAINING EPOCHS */
     struct outputResult epoch_results[NUM_TRAIN_SETS];
     for (int i_epoch = 0; i_epoch < NUM_EPOCHS; i_epoch++)
     {
-        for (int i_input = 0; i_input < NUM_TRAIN_SETS; i_input++)
+        for (int i_trainset = 0; i_trainset < NUM_TRAIN_SETS; i_trainset++)
         {
             // POPLATE FIRST LAYER WITH INPUTS
             for (int i_node = 0; i_node < NUM_INPUTS; i_node++)
             {
-                z_tensor[i_node] = inputs->mem[(i_input * NUM_INPUTS) + i_node];
+                z_tensor[i_node] = inputs[(i_trainset * NUM_INPUTS) + i_node];
             }
 
-            epoch_results[i_input] = runInference(num_layers, i_input);
+            epoch_results[i_trainset] = forwardPass(num_layers, i_trainset);
 
             if (TRAIN)
             {
-                backPropSGD(i_input, num_layers);
+                backPropSGD(i_trainset, num_layers);
             }
         }
     }
@@ -157,25 +179,27 @@ int main()
     return 0;
 }
 
-struct outputResult runInference(int num_layers, int i_trainset)
+struct outputResult forwardPass(int num_layers, int i_trainset)
 {
     if (DEBUG)
     {
         int index = i_trainset * NUM_INPUTS;
-        double x1 = inputs->mem[index];
-        double x2 = inputs->mem[index + 1];
-        int y = exp_outputs->mem[i_trainset];
-        printf("DEBUG: Running training set with inputs %f, %f and expected output %f\n", x1, x2, y);
+        double x1 = inputs[index];
+        double x2 = inputs[index + 1];
+        double y = exp_outputs[i_trainset];
+        printf("Running training set with inputs %f, %f and expected output %f\n", x1, x2, y);
     }
 
-    int index = 0;
+    int index = NUM_INPUTS;
+    int w_index = 0;
+    int z_index = 0;
     for (int i_layer = 1; i_layer < num_layers; i_layer++)
     {
-        for (int i_node = 0; i_node < structure[i_layer]; i_layer++)
+        for (int i_node = 0; i_node < structure[i_layer]; i_node++)
         {
-            z_tensor[index] = nodeMulAcc(num_layers, i_layer, i_node);
+            z_tensor[index] = nodeMulAcc(i_layer, w_index, z_index);
 
-            if (i_layer != (num_layers - 1))
+            if ((i_layer - 1) != 0 || i_layer != (num_layers - 1))
             {
                 if (ACTIV_FUNC == "SIGMOID")
                 {
@@ -192,43 +216,46 @@ struct outputResult runInference(int num_layers, int i_trainset)
                 }
             }
 
+            w_index += structure[i_layer - 1];
             index++;
         }
+
+        z_index += structure[i_layer - 1];
     }
 
     struct outputResult result;
     for (int i_output = 0; i_output < NUM_OUTPUTS; i_output++)
     {
-        result.exp_output[i_output] = exp_outputs->mem[i_trainset + i_output];
-        result.output[i_output] = a_tensor[output_node_index + i_output];
-        result.cost[i_output] = (result.exp_output[i_output] - result.output[i_output]);
+        result.exp_output[i_output] = exp_outputs[i_trainset + i_output];
+        result.output[i_output] = z_tensor[output_node_index + i_output];
+        result.err[i_output] = result.exp_output[i_output] - result.output[i_output];
+        result.cost[i_output] = pow(result.err[i_output], 2);
+        result.d_dost[i_output] = 2 * result.err[i_output];
+    
+        if (DEBUG)
+        {
+            printDoubleArr(z_tensor, num_nodes, "z_tensor");
+            printDoubleArr(a_tensor, num_nodes, "a_tensor");
+            printf("Expected Output: %f, numerical output: %f, error: %f\n\n",  result.exp_output[i_output], result.output[i_output], result.err[i_output]);
+        }
     }
 
     return result;
 }
 
-double nodeMulAcc(int num_layers, int layer, int node)
+double nodeMulAcc(int layer, int w_index, int z_index)
 {
-    int x_index = 0;
-    int w_index = 0;
-    for (int i_layer = 0; i_layer < (layer - 1); i_layer++)
-    {
-        x_index += structure[i_layer];
-        w_index += structure[i_layer] * structure[i_layer + 1];
-    }
-    w_index += node * structure[layer - 1];
-
     double sum = 0;
     for (int i_value = 0; i_value < structure[layer - 1]; i_value++)
     {
         double x;
         if (layer == 1)
         {
-            x = z_tensor[x_index++];
+            x = z_tensor[z_index++];
         }
         else
         {
-            x = a_tensor[x_index++];
+            x = a_tensor[z_index++];
         }
 
         double w = w_tensor[w_index++];
@@ -272,7 +299,6 @@ void weightUpdate(double cost_diff, int i_layer, int j, int k)
 
 int findMaxInt(int arr[], int size)
 {
-
     if (size == 0)
     {
         printf("Error: Array is empty.\n");
@@ -292,13 +318,49 @@ int findMaxInt(int arr[], int size)
     return max;
 }
 
-double randGaussian()
+void* printIntArr(int* arr, int arr_size, const char* arr_desc)
 {
-    double u1 = (double)rand() / RAND_MAX;
-    double u2 = (double)rand() / RAND_MAX;
+    printf("%s: [", arr_desc);
+    for (int index = 0; index < arr_size; index++)
+    {
+        if ((index + 1) == arr_size)
+        {
+            printf("%d]\n", arr[index]);
+            break;
+        }
+        printf("%d, ", arr[index]);
+    }
+}
 
-    // Apply the Box-Muller transform to get two independent standard normal variables
-    double z0 = fabs(sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2));
+void* printDoubleArr(double* arr, int arr_size, const char* arr_desc)
+{
+    printf("%s: [", arr_desc);
+    for (int index = 0; index < arr_size; index++)
+    {
+        if ((index + 1) == arr_size)
+        {
+            printf("%.3f]\n", arr[index]);
+            break;
+        }
+        printf("%.3f, ", arr[index]);
+    }
+}
 
-    return z0;
+void* trainData_XOR(void* arg)  
+{
+    // XOR EXAMPLE
+    int INPUT_VARS[2] = {0, 1};
+    int i_train_set = 0;
+    for (int i_input  = 0; i_input < sizeof(INPUT_VARS)/sizeof(INPUT_VARS[0]); i_input++)
+    {
+        for (int j_input = 0; j_input < sizeof(INPUT_VARS)/sizeof(INPUT_VARS[0]); j_input++)
+        {
+            inputs[i_train_set * NUM_INPUTS] = INPUT_VARS[i_input];
+            inputs[(i_train_set * NUM_INPUTS) + 1] = INPUT_VARS[j_input];
+            exp_outputs[i_train_set] = abs(INPUT_VARS[i_input] - INPUT_VARS[j_input]);
+            i_train_set++;
+        }
+    }
+
+    return 0;
 }
