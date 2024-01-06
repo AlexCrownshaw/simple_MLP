@@ -26,14 +26,13 @@
 #define NUM_EPOCHS 3
 #define NUM_TRAIN_SETS 4
 #define ACTIV_FUNC "SIGMOID"
+#define LEARN_FACTOR 0.1
 
 struct outputResult
 {
     double output[NUM_OUTPUTS];
     double exp_output[NUM_OUTPUTS];
     double err[NUM_OUTPUTS];
-    double cost[NUM_OUTPUTS];
-    double d_dost[NUM_OUTPUTS];
 };
 
 int* structure;
@@ -47,23 +46,25 @@ int output_node_index;
 int num_nodes = 0;
 
 struct outputResult forwardPass(int, int);
-double nodeMulAcc(int, int, int);
-void backPropSGD(int, int);
-void weightUpdate(double, int, int, int);
+double nodeMVM(int, int, int);
+void backPropSGD(int, int, double[NUM_OUTPUTS]);
+void weightUpdate(double, int, int, int, int, int);
 int findMaxInt(int[], int);
 void* printIntArr(int*, int, const char*);
 void* printDoubleArr(double*, int, const char*);
-
+void* trainData_XOR(void*);
 
 int main()
 {
     pthread_t train_data_thread;
-    if (pthread_create(&train_data_thread, NULL, trainData_XOR, NULL) != 0) {
+    if (pthread_create(&train_data_thread, NULL, trainData_XOR, NULL) != 0)
+    {
         fprintf(stderr, "Failed to create thread.\n");
         return 1;
     }
 
-    if (pthread_join(train_data_thread, NULL) != 0) {
+    if (pthread_join(train_data_thread, NULL) != 0)
+    {
         fprintf(stderr, "Failed to join thread.\n");
         return 1;
     }
@@ -74,11 +75,11 @@ int main()
         {
             for (int i_input = 0; i_input < NUM_INPUTS; i_input++)
             {
-                printf("INPUT_%d: %f ", i_input, inputs[i_train_set + i_input]);
+                printf("INPUT_%d: %.2f ", i_input, inputs[i_train_set + i_input]);
             }
             for (int i_output = 0; i_output < NUM_OUTPUTS; i_output++)
             {
-                printf("EXP_OUTPUT_%d: %f ", i_output, exp_outputs[i_train_set + i_output]);  
+                printf("EXP_OUTPUT_%d: %.2f ", i_output, exp_outputs[i_train_set + i_output]);  
             }
             printf("\n");
         }
@@ -171,7 +172,7 @@ int main()
 
             if (TRAIN)
             {
-                backPropSGD(i_trainset, num_layers);
+                backPropSGD(num_layers, num_weights, epoch_results[i_trainset].err);
             }
         }
     }
@@ -197,7 +198,7 @@ struct outputResult forwardPass(int num_layers, int i_trainset)
     {
         for (int i_node = 0; i_node < structure[i_layer]; i_node++)
         {
-            z_tensor[index] = nodeMulAcc(i_layer, w_index, z_index);
+            z_tensor[index] = nodeMVM(i_layer, w_index, z_index);
 
             if ((i_layer - 1) != 0 || i_layer != (num_layers - 1))
             {
@@ -229,21 +230,19 @@ struct outputResult forwardPass(int num_layers, int i_trainset)
         result.exp_output[i_output] = exp_outputs[i_trainset + i_output];
         result.output[i_output] = z_tensor[output_node_index + i_output];
         result.err[i_output] = result.exp_output[i_output] - result.output[i_output];
-        result.cost[i_output] = pow(result.err[i_output], 2);
-        result.d_dost[i_output] = 2 * result.err[i_output];
     
         if (DEBUG)
         {
             printDoubleArr(z_tensor, num_nodes, "z_tensor");
             printDoubleArr(a_tensor, num_nodes, "a_tensor");
-            printf("Expected Output: %f, numerical output: %f, error: %f\n\n",  result.exp_output[i_output], result.output[i_output], result.err[i_output]);
+            printf("Expected Output: %.4f, numerical output: %.4f, error: %.4f\n\n",  result.exp_output[i_output], result.output[i_output], result.err[i_output]);
         }
     }
 
     return result;
 }
 
-double nodeMulAcc(int layer, int w_index, int z_index)
+double nodeMVM(int layer, int w_index, int z_index)
 {
     double sum = 0;
     for (int i_value = 0; i_value < structure[layer - 1]; i_value++)
@@ -259,41 +258,64 @@ double nodeMulAcc(int layer, int w_index, int z_index)
         }
 
         double w = w_tensor[w_index++];
-
         sum += x * w;
     }
 
     return sum;
 }
 
-double nodeMulAccCUDA(int i_layer, int i_node)
+double nodeMVM_CUDA(int i_layer, int i_node)
 {
 
 }
 
-void backPropSGD(int i_input, int num_layers)
+void backPropSGD(int num_layers, int num_weights, double err[NUM_OUTPUTS])
 {
-    double cost_diff = 0;
-
-    // cost_diff = pow((VALUES[num_layers - 1][i_output] - EXP_OUTPUTS[num_layers - 1][i_output]), 2);
-    for (int i_layer = num_layers - 1; i_layer > 0; i_layer--)
+    for (int i_output = (NUM_OUTPUTS - 1); i_output >= 0; i_output--)
     {
-        for (int j_node = 0; j_node < structure[i_layer]; j_node++)
+        int w_index = num_weights - 1;
+        int a_index = num_nodes - NUM_OUTPUTS - 1;
+        double d_cost = 2 * err[i_output];
+        for (int j_node = structure[num_layers - 2] - 1; j_node >=0; j_node--)
         {
-            for (int k_node = 0; k_node < structure[i_layer]; k_node++)
-            {
-                weightUpdate(cost_diff, i_layer, j_node, k_node);
-            }
+            weightUpdate(d_cost, (num_layers - 1), i_output, j_node, w_index--, a_index--);
         }
     }
 }
 
-void weightUpdate(double cost_diff, int i_layer, int j, int k)
+void weightUpdate(double chain, int i_layer, int i_node, int j_node, int w_index, int a_index)
 {
-    double delta = 0;
-    for (int i_node = 0; i_node < structure[i_layer]; i_node++)
+    if (i_layer - 1 != 0)
     {
-        
+        w_tensor[w_index] += chain * a_tensor[a_index] * LEARN_FACTOR;
+    }
+    else
+    {
+        w_tensor[w_index] += chain * z_tensor[a_index] * LEARN_FACTOR;
+    }
+
+    chain *= w_tensor[w_index];
+    if (ACTIV_FUNC == "SIGMOID")
+    {
+        chain *= sigmoid(z_tensor[a_index], 1);
+    }
+    else if (ACTIV_FUNC == "RELU")
+    {
+        chain += relu(z_tensor[a_index], 1);
+    }
+
+    i_node = j_node;
+    a_index -= (i_node + 1);
+
+    w_index -= structure[i_layer] * structure[i_layer - 1];
+    i_layer--;
+
+    if (i_layer != 0)
+    {
+        for (int j_node = structure[i_layer - 1] - 1; j_node >=0; j_node--)
+        {
+            weightUpdate(chain, i_layer, i_node, j_node, w_index--, a_index--);
+        }
     }
 }
 
