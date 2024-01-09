@@ -23,10 +23,10 @@
 #define NUM_OUTPUTS 1
 #define H_LAYERS (int[]){3, 2}
 
-#define NUM_EPOCHS 3
+#define NUM_EPOCHS 10
 #define NUM_TRAIN_SETS 4
 #define ACTIV_FUNC "SIGMOID"
-#define LEARN_FACTOR 0.1
+#define LEARN_FACTOR 2
 
 struct outputResult
 {
@@ -41,6 +41,7 @@ double exp_outputs[NUM_OUTPUTS * NUM_TRAIN_SETS];
 double* z_tensor;
 double* a_tensor;
 double* w_tensor;
+double* dw_tensor;
 
 int output_node_index;
 int num_nodes = 0;
@@ -48,7 +49,7 @@ int num_nodes = 0;
 struct outputResult forwardPass(int, int);
 double nodeMVM(int, int, int);
 void backPropSGD(int, int, double[NUM_OUTPUTS]);
-void weightUpdate(double, int, int, int, int, int);
+void weightDelta(double, int, int, int, int, int);
 int findMaxInt(int[], int);
 void* printIntArr(int*, int, const char*);
 void* printDoubleArr(double*, int, const char*);
@@ -122,7 +123,7 @@ int main()
     int index = 0;
     for (int i_layer = 1; i_layer < num_layers; i_layer++)
     {
-        for (int i_node = 0; i_node < structure[i_layer]; i_node++)
+        for (int i_node = 0; i_node < structure[i_layer]; i_node++) 
         {
             z_tensor[index] = 0;
             a_tensor[index] = 0;
@@ -134,6 +135,7 @@ int main()
 
     /* ALLOCATE WEIGHTS ARRAY AND POPULATE WITH RANDOM GAUSSIAN DISTRIBUTION */
     w_tensor = (double*)malloc(num_weights * sizeof(double));
+    dw_tensor = (double*)malloc(num_weights * sizeof(double));
     index = 0;
     for (int i_layer = 0; i_layer < num_layers - 1; i_layer++)
     {
@@ -160,6 +162,11 @@ int main()
     struct outputResult epoch_results[NUM_TRAIN_SETS];
     for (int i_epoch = 0; i_epoch < NUM_EPOCHS; i_epoch++)
     {
+        if (DEBUG)
+        {
+            printf("Running Epoch %d:\n", i_epoch);
+        }
+
         for (int i_trainset = 0; i_trainset < NUM_TRAIN_SETS; i_trainset++)
         {
             // POPLATE FIRST LAYER WITH INPUTS
@@ -278,43 +285,53 @@ void backPropSGD(int num_layers, int num_weights, double err[NUM_OUTPUTS])
         double d_cost = 2 * err[i_output];
         for (int j_node = structure[num_layers - 2] - 1; j_node >=0; j_node--)
         {
-            weightUpdate(d_cost, (num_layers - 1), i_output, j_node, w_index--, a_index--);
+            weightDelta(d_cost, (num_layers - 1), i_output, j_node, w_index--, a_index--);
+        }
+
+        for (int index = 0; index < num_weights; index++)
+        {
+            w_tensor[index] -= dw_tensor[index] * LEARN_FACTOR;
         }
     }
 }
 
-void weightUpdate(double chain, int i_layer, int i_node, int j_node, int w_index, int a_index)
+void weightDelta(double chain, int i_layer, int i_node, int j_node, int w_index, int a_index)
 {
     if (i_layer - 1 != 0)
     {
-        w_tensor[w_index] += chain * a_tensor[a_index] * LEARN_FACTOR;
+        dw_tensor[w_index] = chain * a_tensor[a_index];
     }
     else
     {
-        w_tensor[w_index] += chain * z_tensor[a_index] * LEARN_FACTOR;
+        dw_tensor[w_index] = chain * z_tensor[a_index];
     }
-
-    chain *= w_tensor[w_index];
-    if (ACTIV_FUNC == "SIGMOID")
-    {
-        chain *= sigmoid(z_tensor[a_index], 1);
-    }
-    else if (ACTIV_FUNC == "RELU")
-    {
-        chain += relu(z_tensor[a_index], 1);
-    }
-
-    i_node = j_node;
-    a_index -= (i_node + 1);
-
-    w_index -= structure[i_layer] * structure[i_layer - 1];
-    i_layer--;
 
     if (i_layer != 0)
     {
+
+        chain *= w_tensor[w_index];
+        if (ACTIV_FUNC == "SIGMOID")
+        {
+            chain *= sigmoid(z_tensor[a_index], 1);
+        }
+        else if (ACTIV_FUNC == "RELU")
+        {
+            chain += relu(z_tensor[a_index], 1);
+        }
+
+        w_index -= ((j_node * structure[i_layer]) + i_node + (structure[i_layer - 1] - (j_node + 1)) + 1);
+
+        i_node = j_node;
+        a_index -= (i_node + 1);
+
+        i_layer--;
+
         for (int j_node = structure[i_layer - 1] - 1; j_node >=0; j_node--)
         {
-            weightUpdate(chain, i_layer, i_node, j_node, w_index--, a_index--);
+            weightDelta(chain, i_layer, i_node, j_node, w_index, a_index);
+
+            w_index -= structure[i_layer];
+            a_index--;
         }
     }
 }
